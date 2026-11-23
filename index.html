@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>wlx 的工程笔记</title>
+  <meta name="description" content="投机解码、推理系统与 benchmark 方法论的工程笔记。">
+  <meta property="og:title" content="wlx 的工程笔记">
+  <meta property="og:description" content="投机解码、推理系统与 benchmark 方法论的工程笔记。">
+  <meta property="og:type" content="website">
+  <link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+  <main>
+    <header class="site">
+      <a class="brand" href="./">wlx 的工程笔记</a>
+      <nav>
+        <a href="https://github.com/0515wlx">GitHub</a>
+        <a href="https://github.com/0515wlx/draftslice">DraftSlice</a>
+      </nav>
+    </header>
+
+    <p class="eyebrow">Engineering notes</p>
+    <h1>把测量做在正确的地方</h1>
+    <p class="lede">
+      投机解码、推理系统，以及那些“看起来能加速、上线却归零”的优化。
+      尽量只写有数字、有对照、能复现的东西。
+    </p>
+
+    <section>
+      <h2 style="margin-top: 40px;">文章</h2>
+      <ul class="post-list">
+        <li>
+          <p class="date">2026-11-23 · 投机解码 · 12 分钟</p>
+          <h2><a href="posts/2026-11-draftslice-lean.html">从 1.19× 到 +6.1%：一次 draft 头切片的生产化复盘</a></h2>
+          <p>
+            同一个 kernel、同一套 schema，把 prompt 从裸字符串换成 chat template，
+            端到端收益就从 1.19× 变成 1.00×。最后活下来的，是一条只有 +6.1% 的
+            lean 路径，以及一堆同样有价值的负面结果。
+          </p>
+        </li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>关于</h2>
+      <p>
+        我关注大模型推理系统的真实吞吐：draft head、grammar、batch 形状、
+        scheduler 和 benchmark 方法。这里的文章基本都来自自己的实验记录，
+        原始 JSON 和日志保留在本地，正文给出可复现的命令与结论。
+      </p>
+      <p>
+        如果一篇文章里出现“加速”，它至少应该同时回答三个问题：
+        相对什么 baseline、在什么请求形状下、以及这个收益能不能活过一个真实 server。
+      </p>
+    </section>
+
+    <footer class="site">
+      <p>© 2026 wlx · 文章采用 CC BY 4.0，代码采用 Apache-2.0</p>
+    </footer>
+  </main>
+</body>
+</html>

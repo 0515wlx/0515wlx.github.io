@@ -1,0 +1,390 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>从 1.19× 到 +6.1%：一次 draft 头切片的生产化复盘 · wlx 的工程笔记</title>
+  <meta name="description" content="同一个 kernel、同一套 schema，请求形状一变，投机解码 draft 头切片的收益就从 1.19× 变成 1.00×。记录 lean 路径的 +6.1%，以及那些被 Amdahl 和 adapter tax 吃掉的优化。">
+  <meta property="og:title" content="从 1.19× 到 +6.1%：一次 draft 头切片的生产化复盘">
+  <meta property="og:description" content="同一个 kernel、同一套 schema，请求形状一变，收益就从 1.19× 变成 1.00×。记录 lean 路径的 +6.1%，以及那些被 Amdahl 和 adapter tax 吃掉的优化。">
+  <meta property="og:type" content="article">
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+  <main>
+    <header class="site">
+      <a class="brand" href="../">wlx 的工程笔记</a>
+      <nav>
+        <a href="https://github.com/0515wlx">GitHub</a>
+        <a href="https://github.com/0515wlx/draftslice">DraftSlice</a>
+      </nav>
+    </header>
+
+    <article>
+      <p class="eyebrow">投机解码 · 工程复盘</p>
+      <h1>从 1.19× 到 +6.1%：一次 draft 头切片的生产化复盘</h1>
+      <p class="lede">
+        同一个 kernel、同一套 JSON Schema、同一批 tool call。把 prompt 从裸字符串
+        换成 chat template，端到端收益就从 1.19× 变成 1.00×。最后活下来的，是一条
+        只有 +6.1% 的 lean 路径，以及一堆同样有价值的负面结果。
+      </p>
+      <p class="meta">2026-11-23 · 约 12 分钟 · Qwen3.5-4B / vLLM 0.34 / A100-80GB</p>
+
+      <div class="callout">
+        <p><strong>一句话结论：</strong>draft 头切片是一个真实的 kernel 优化，但在
+        matched drafter、生产 chat 形状、B=1 的 4B 服务上，它最终只有
+        <strong>+6.1%</strong>。剩下的空间不大，而且大部分是工程细节，不是新的算法方向。</p>
+      </div>
+
+      <div class="toc">
+        <strong>目录</strong>
+        <ol>
+          <li><a href="#what">我们在做什么</a></li>
+          <li><a href="#shape">第一个坑：请求形状</a></li>
+          <li><a href="#amdahl">第二个坑：Amdahl 与 adapter tax</a></li>
+          <li><a href="#lean">lean 版做对了什么</a></li>
+          <li><a href="#accounting">16.2% 的账本</a></li>
+          <li><a href="#negative">负面结果清单</a></li>
+          <li><a href="#headroom">还剩多少空间</a></li>
+          <li><a href="#when">什么时候值得用</a></li>
+          <li><a href="#repro">代码与复现</a></li>
+        </ol>
+      </div>
+
+      <h2 id="what">1. 我们在做什么</h2>
+      <p>
+        结构化输出（JSON Schema、regex、grammar）有一个很自然的性质：在任意一个
+        decode 位置，词表里只有一小部分 token 是合法的。一个 248,320 词表的 draft
+        LM head，如果只算当前 grammar 状态允许的行，理论上可以把一次 1.27 GB 的
+        权重读取缩到几十 KB。
+      </p>
+      <p>
+        这就是 DraftSlice 的出发点：在 vLLM / SGLang 的投机解码里，给每个请求维护
+        一份 grammar shadow，把 draft head 的候选行限制在合法集合内；目标模型的
+        verify 仍然走全词表，保证最终输出不受 draft 影响。kernel 本身不是问题：
+        4B、bf16、A100 上，全词表 head 约 <strong>744 µs</strong>，128 行的 slice
+        kernel 约 <strong>65 µs</strong>，看起来是 11×。
+      </p>
+      <p>
+        问题从“11× 的 kernel 为什么只剩 6%”开始。
+      </p>
+
+      <h2 id="shape">2. 第一个坑：请求形状</h2>
+      <p>
+        最早的一次端到端实验给出的数字是 <strong>1.19×</strong>。它没有造假，但它
+        测的是另一个 workload：实验脚本直接把裸字符串喂给 <code>LLM.generate</code>，
+        而生产环境走的是 <code>/v1/chat/completions</code>，vLLM 会套 chat template。
+      </p>
+
+      <table>
+        <thead>
+          <tr><th>同一引擎、同一 schema、同一批 tool case</th><th>built-in τ</th><th>slice τ</th><th>built-in tok/s</th><th>slice tok/s</th><th>speedup</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>裸 completion prompt</td><td>3.22</td><td>7.67</td><td>91.6</td><td>108.5</td><td><strong>1.186×</strong></td></tr>
+          <tr><td>chat template（生产形状）</td><td>5.09</td><td>7.33</td><td>129.5</td><td>128.6</td><td><strong>0.996×</strong>（均值）</td></tr>
+        </tbody>
+      </table>
+
+      <figure>
+        <img src="../assets/tau-workload-shape.svg" alt="裸 prompt 与 chat template 下 baseline 与 slice 的 accept length 对比">
+        <figcaption>图 1：kernel 没变，变的是 baseline 的 accept length。chat template 让前 ~15 个 token 高度可预测，matched MTP 的 τ 从 ~3.2 升到 ~5.1。</figcaption>
+      </figure>
+
+      <p>
+        chat/tool template 让开头是一段高度可预测的 tool-call 前缀，matched MTP 在
+        前两个位置就已经基本猜对（per-position acceptance 252/266、252/266），
+        整段 baseline 的 τ 也从 ~3.2 升到 ~5.1。grammar mask 在两种形状下都能把 τ
+        推到 ~7.3–7.7，但 verify step 的减少从约 50% 缩到约 27%。同一份代码，
+        收益从 +19% 变成 ~0%。
+      </p>
+
+      <div class="callout">
+        <p><strong>方法学教训：</strong>benefit claim 必须用生产请求形状。裸 prompt
+        会把 baseline 的 accept length 压低约 2×，从而把 masking/slicing 的收益
+        夸大 2× 以上。</p>
+      </div>
+
+      <h2 id="amdahl">3. 第二个坑：Amdahl 与 adapter tax</h2>
+      <p>
+        即使请求形状对了，draft head 也只是 speculative step 的一部分。在生产形状
+        （4B、B=1、k=8、chat/tool）下，用 CUDA event 只测 MTP draft head：
+      </p>
+
+      <table>
+        <thead><tr><th>指标</th><th>数值</th></tr></thead>
+        <tbody>
+          <tr><td>wall time</td><td>0.918 s</td></tr>
+          <tr><td>output tokens</td><td>115</td></tr>
+          <tr><td>verify steps</td><td>19</td></tr>
+          <tr><td>draft head calls</td><td>200（<strong>10.5 次/step</strong>）</td></tr>
+          <tr><td>full head / call</td><td><strong>0.744 ms</strong></td></tr>
+          <tr><td>draft head 占 wall</td><td><strong>16.2%</strong></td></tr>
+        </tbody>
+      </table>
+
+      <p>
+        0.744 ms 读 1.27 GB，约 <strong>1.72 TB/s</strong>，已经贴着 A100 的 HBM
+        峰值。kernel 没有调优空间；唯一能做的是少读行。按 63% 的 candidate 覆盖率
+        算，理论 head saving 是
+        <code>10.5 × 0.63 × (0.744 − 0.065) ≈ 4.5 ms/step</code>。
+      </p>
+      <p>
+        但最早那版 adapter 的代价是按 <em>每次 draft call</em> 计的。debug timer 拆出来：
+      </p>
+
+      <table>
+        <thead><tr><th>组件</th><th>ms/step</th></tr></thead>
+        <tbody>
+          <tr><td>slice logits build</td><td>2.49</td></tr>
+          <tr><td>grammar shadow fork + D2H</td><td>2.23</td></tr>
+          <tr><td>contract emission</td><td>0.61</td></tr>
+          <tr><td>valid-set construction</td><td>0.11</td></tr>
+          <tr><td>sampled-token D2H</td><td>0.08</td></tr>
+          <tr><td>未计时的 dispatch / sync / 分配</td><td>~14.7</td></tr>
+          <tr><td><strong>gross adapter tax</strong></td><td><strong>~20.3</strong></td></tr>
+        </tbody>
+      </table>
+
+      <p>
+        面对最大 7.1 ms/step 的 head saving，20.3 ms 的 tax 不可能赢。tax 的来源很
+        具体：每次 call 重建 GPU index tensor、每次 call <code>torch.full</code>
+        一个 1×V 的输出、每一步都发 contract/trace，以及每个 draft position 后一次
+        阻塞的 <code>.tolist()</code>——一个 verify step 里 8 次 CPU/GPU 同步。
+        k=1 时连 shadow fork 都不需要，slice arm 仍然只有 0.95×。
+      </p>
+
+      <blockquote>
+        <p>优化器必须装进 head 的预算里，而不是站在它旁边。</p>
+      </blockquote>
+
+      <h2 id="lean">4. lean 版做对了什么</h2>
+      <p>
+        <code>DRAFTSLICE_VLLM_LEAN=1</code> 不改变候选集，也不改变 τ。它只改变
+        “候选 logits 怎么算出来”：
+      </p>
+      <ul>
+        <li><strong>缓存 device payload。</strong>按精确的
+          <code>(row, TokenSet identity)</code> 缓存 padded int32 token matrix 和
+          row index，2048 条 LRU。grammar shadow 本来就有按 state 缓存的 CPU
+          <code>TokenSet</code>，payload 可以跨 step / request 复用。</li>
+        <li><strong>按宽度分组。</strong>candidate 宽度相同的行共享一次 launch 和
+          一次权重读取；batch 内相同 grammar state 的行也合并。</li>
+        <li><strong>复用输出 buffer。</strong>每个 shape 一个 <code>[rows, vocab]</code>
+          的 fp32 buffer，每次只填 <code>-inf</code>，不再 <code>torch.full</code>。</li>
+        <li><strong>每个 group 一次 fused launch。</strong>没有 exact set 的行才走
+          全词表 head。</li>
+        <li><strong>热路径不要 telemetry。</strong>不做 per-step
+          <code>DraftContract</code>/trace、不记录 policy、不 compile plan、不跑
+          screener；如果配置了 profile table，只在每个 verify step 解析一次 cell。</li>
+        <li><strong>startup 级 cost gate。</strong>未校准的 cost artifact 直接在启动时
+          关掉 slicing，走 stock speculator；而不是每个 call 交完 shadow tax 再退回
+          full head。</li>
+      </ul>
+
+      <p>
+        正确性没有变化：6 个 tool case × 3 reps，greedy token ids 与 built-in 完全
+        一致，validity 1.0，τ 7.33，accept rate 0.916。
+      </p>
+
+      <table>
+        <thead><tr><th>单 server、tool-only、45 s、同一会话</th><th>tok/s</th><th>median</th><th>vs built-in</th></tr></thead>
+        <tbody>
+          <tr><td>built-in MTP（9 reps）</td><td>127.8 / 127.7 / 128.6 / 127.1 / 127.0 / 125.6 / 125.4 / 124.8 / 125.6</td><td>127.03</td><td>1.000×</td></tr>
+          <tr><td>旧 non-lean slice（6 reps）</td><td>119.2 / 120.1 / 120.9 / 120.3 / 119.9 / 120.0</td><td>120.02</td><td>0.945×</td></tr>
+          <tr><td><strong>lean exact slice（6 reps）</strong></td><td>130.6 / 133.4 / 128.3 / 132.6 / 133.2 / 133.1</td><td>132.85</td><td><strong>1.046×</strong></td></tr>
+          <tr><td><strong>lean exact slice（最后 3 reps）</strong></td><td>134.9 / 133.8 / 134.8</td><td><strong>134.76</strong></td><td><strong>1.061×</strong></td></tr>
+        </tbody>
+      </table>
+
+      <p>
+        我不想只报最后 3 次的 134.76。6 次的中位是 132.85（+4.6%），最后 3 次的
+        中位是 134.76（+6.1%）；两者都对，差异主要来自引擎实例的会话内漂移。真实
+        可承诺的数字是“<strong>+4.6% 到 +6.1%</strong>”。
+      </p>
+
+      <h2 id="accounting">5. 16.2% 的账本</h2>
+      <p>
+        16.2% 的 head share 不会原样变成 16% 的吞吐。它会在四个地方缩水：
+      </p>
+
+      <table>
+        <thead><tr><th>量</th><th>数值</th></tr></thead>
+        <tbody>
+          <tr><td>draft head calls / step</td><td>10.5</td></tr>
+          <tr><td>full / sliced head 每次</td><td>0.744 / 0.065 ms</td></tr>
+          <tr><td>exact candidate 覆盖率</td><td><strong>63%</strong>（1517/2408 calls）</td></tr>
+          <tr><td>无 valid set 的 fallback</td><td>37%</td></tr>
+          <tr><td>gross head saving</td><td>4.49 ms/step</td></tr>
+          <tr><td>τ 从 5.04 升到 7.33 的 verify 代价（反事实）</td><td><strong>−3.0%</strong></td></tr>
+          <tr><td>realized head gain</td><td><strong>+7.8%</strong></td></tr>
+          <tr><td><strong>net</strong></td><td><strong>+4.6%</strong></td></tr>
+        </tbody>
+      </table>
+
+      <p>
+        mask 把 τ 从 5.04 推到 7.33。这个模型的 target verify 成本接近 per-token，
+        多 verify 1.63 个 token/step 要付约 3% 的吞吐；coverage 只有 63%，另外 37%
+        的 position 仍然读完整的 1.27 GB head；剩下的 per-call 残留开销再吃掉一点。
+        最后就是 +4.6% 到 +6.1%。
+      </p>
+
+      <figure>
+        <img src="../assets/head-share-vs-k.svg" alt="draft head 占 step 的比例以及 head 免费时的上限随 k 和 batch 的变化">
+        <figcaption>图 2：head share 随 k 增长，且在 B=8 基本不变——这是这个优化不像 grammar mask 那样随 batch 稀释的原因。但上限也只有 15–25%。</figcaption>
+      </figure>
+
+      <h2 id="negative">6. 负面结果清单</h2>
+      <p>
+        这个项目真正值钱的部分，可能是下面这些“不要做”。它们都花了实打实的 GPU 时间。
+      </p>
+
+      <h3>6.1 静态 top-16k 词表（free-form）</h3>
+      <p>
+        如果想绕开 grammar、直接用一个高频词表做 head，生产形状下 τ 从 5.09 掉到
+        3.62，吞吐 129.7 → 45.8 tok/s，<strong>0.35×</strong>；B=8 的另一组是
+        0.49×。draft 需要的恰好是被裁掉的那些 token。这个方向可以彻底放弃。
+      </p>
+
+      <h3>6.2 int8 draft head</h3>
+      <p>
+        只量化 MTP 的 <code>lm_head</code>，per-row 对称 int8，反量化回 bf16 计算。
+        1.07% 的相对权重误差下，τ 5.087 → 4.933（<strong>−3.0%</strong>）；
+        per-tensor 3.38% 误差下 τ 4.627（<strong>−9.0%</strong>）。int8 + lean
+        masking 时 τ 保持 7.333，但那只说明 grammar 候选集修正了 int8 的错误 argmax，
+        int8 只对 37% 的 fallback 行有用。要为此写一个 int8 GEMV、再存一份 0.64 GB
+        权重，不划算。
+      </p>
+
+      <h3>6.3 DFlash all-position</h3>
+      <p>
+        DFlash 一次 forward 出一个 block，position-0 slicing 只覆盖 1/17 的 head。
+        all-position mask 在 B=1 看起来很好（τ 2.67 → 5.12，vs stock DFlash
+        约 1.19×），但和 built-in MTP 比只是 B=1 +10.5%、B=8 −1.6%；在 SGLang 上
+        实测 0.78×。fused packed-bitmask 能把 B=8 的 all-position 从 11.6% 的劣势
+        拉回来，但 B=32 仍然打平。per-position slice 需要顺序采样、放弃 block 的
+        批处理，收益上限约 1.35×，工程难度远大于收益。
+      </p>
+
+      <h3>6.4 CUDA graph 下的 hook</h3>
+      <p>
+        SGLang 的 draft-head hook 在 CUDA graph 下根本不会被调到；vLLM 的 FULL
+        decode graph 也会绕过 Python hook。强制 <code>--enforce-eager</code> 的代价
+        比 slice 的收益大（4B EAGLE 约 182 → 60 tok/s）。把 mask/rows 做成 graph
+        可捕获的静态 buffer 是另一个项目，而且 graph 对全词表 head 本身几乎没用
+        （HBM-bound）。
+      </p>
+
+      <h3>6.5 plan / cost / scheduler 上热路径</h3>
+      <p>
+        在 B=1、k=8 下，per-step compile <code>StepPlan</code> 的 plan session 实测
+        <strong>6.9%</strong> 的额外开销；未校准的 cost gate 最初还会再叠加 19.8%，
+        后来改成在 startup 直接关掉 slicing，才把这个损失清零。更关键的是，在结构化
+        cell 上，per-cell oracle 相对最好的固定配置是 <strong>1.000×</strong>。
+        也就是说，这套系统层在 latency 上没有可测的 headroom。它最后只留下一个
+        “按 workload/batch 选 k 和是否 slice”的路由表，不需要 learned controller。
+      </p>
+
+      <h3>6.6 多 server 同机 A/A</h3>
+      <p>
+        早期在同一台机器上起三个 vLLM server 做 A/A，旧 slice 测出 0.94×；单
+        server、同一 GPU、依次重启后是 0.998–1.00×。多 server co-location 会放大
+        adapter tax，也会让 baseline 自己漂移。生产形状是单 server。
+      </p>
+
+      <h3>6.7 裸 prompt 的 1.19×</h3>
+      <p>
+        这条已经在前面说过，但它值得单独列出来：一个错误的 benchmark 形状可以
+        让一个中性优化看起来像 +19%。这比任何 kernel bug 都更贵。
+      </p>
+
+      <h2 id="headroom">7. 还剩多少空间</h2>
+      <p>
+        这是用户最关心的问题。把能想到的 lever 都列出来，按“上限 / 代价”排序：
+      </p>
+
+      <table>
+        <thead><tr><th>方向</th><th>估计上限</th><th>判断</th></tr></thead>
+        <tbody>
+          <tr><td>coverage 63% → ~100%（snapshot-position sets）</td><td>再 +2–4 pp</td><td>需要真正的“下一位置”状态设计，工程量最大，收益有限</td></tr>
+          <tr><td>去掉 per-position <code>.tolist()</code> 同步</td><td>~+1.5%</td><td>中等工程，可能被 async sampler 的复杂度吃掉</td></tr>
+          <tr><td>lean 在 B≥8 的表现</td><td>未知，可能 0 或负</td><td>旧路径 B=8 已经是回归；lean 没有测过，不要假设</td></tr>
+          <tr><td>CUDA graph 支持</td><td>&lt;1%</td><td>baseline 也会变快；全词表 head 是 HBM-bound</td></tr>
+          <tr><td>int8 head</td><td>负 / 中性</td><td>τ −3%；与 lean 叠加时 τ 不变，只帮 fallback</td></tr>
+          <tr><td>TP&gt;1 / 量化 head</td><td>低</td><td>head share 在 B≥8 只有 2–7%，且当前路径不支持</td></tr>
+          <tr><td>DFlash per-position slice</td><td>上限 ~1.35×</td><td>需要顺序 block sampler，放弃 batched GEMM；all-position mask 在 B≥8 已经不成立</td></tr>
+          <tr><td>MoE 的 (k, τ) 选择</td><td>B=32 时 k=1 vs k=4 约 +24%</td><td>真实收益，但属于 per-model k 表，不是 draft 头切片</td></tr>
+        </tbody>
+      </table>
+
+      <p>
+        把乐观项加在一起，B=1 结构化、matched 4B 上大概还能从 +6.1% 推到
+        <strong>+8–10%</strong>，代价是 coverage 和 async 两块硬工程。再往上就需要
+        换问题：要么是 mismatched drafter（draft 本身不懂语法，grammar guidance
+        的收益才大），要么是 block drafting 的逐位置状态设计。前者是 upstream
+        已经在做的事（vLLM #47885、SGLang 的 draft 侧 grammar 缺口），后者难度
+        远大于收益。
+      </p>
+
+      <div class="callout">
+        <p><strong>结论：</strong>作为“draft 头切片”这个单独命题，空间基本见底。
+        它是一个 Amdahl 问题，不是一个 kernel 问题。继续投入的边际收益，已经低于
+        把测量方法、负面结果和 +6.1% 的 lean 路径写清楚的价值。</p>
+      </div>
+
+      <h2 id="when">8. 什么时候值得用</h2>
+      <table>
+        <thead><tr><th>场景</th><th>建议</th></tr></thead>
+        <tbody>
+          <tr><td>matched drafter、free-form</td><td>built-in，没有东西可切</td></tr>
+          <tr><td>matched drafter、结构化、B=1</td><td>可以试 lean exact slice；先在自己的 workload 上做 A/B，不要假设能拿到 6%</td></tr>
+          <tr><td>mismatched / 慢 drafter</td><td>先做 draft 侧 grammar guidance，收益比 head slicing 大</td></tr>
+          <tr><td>B≥8 生产</td><td>按 profile cell 门控；这一档历史结果是回归，默认 built-in</td></tr>
+          <tr><td>必须开 CUDA graph</td><td>当前 hook 会被绕过；要么保持 eager，要么把 mask/rows 做进 graph</td></tr>
+          <tr><td>TP&gt;1 / 量化 head</td><td>保持 stock head；head share 小，路径也不支持</td></tr>
+        </tbody>
+      </table>
+
+      <h2 id="repro">9. 代码与复现</h2>
+      <p>
+        代码在 <a href="https://github.com/0515wlx/draftslice">0515wlx/draftslice</a>。
+        lean 路径是 opt-in：
+      </p>
+<pre><code>DRAFTSLICE_VLLM=1 DRAFTSLICE_VLLM_SLICE=1 DRAFTSLICE_VLLM_LEAN=1 \
+  vllm serve Qwen/Qwen3.5-4B --enforce-eager \
+  --speculative-config '{"method":"draftslice_mtp","num_speculative_tokens":8}'</code></pre>
+      <p>
+        设计细节、gate 语义、完整账本和限制在
+        <a href="https://github.com/0515wlx/draftslice/blob/main/docs/lean-slice.md">docs/lean-slice.md</a>。
+        单测覆盖 payload 复用、输出 buffer 复用和与参考 builder 的逐元素一致性：
+      </p>
+<pre><code>python -m pytest tests/test_lean_logits.py -q
+python -m ruff check src tests</code></pre>
+      <p>
+        复现时请遵守三条：用生产请求模板；一台机器只起一个 server；把
+        <code>mask</code>（全 head + grammar mask）和 <code>slice</code>
+        （只算候选行）分开报，不要用 <code>slice/mtp</code> 一个比值掩盖归因。
+      </p>
+
+      <hr>
+
+      <p>
+        如果这篇文章只能留下一句话：<strong>先量请求形状，再量 head 占比，最后再谈
+        kernel 加速。</strong>大部分的“加速”不是被 kernel 吃掉的，是被 baseline 和
+        Amdahl 吃掉的。
+      </p>
+
+      <p class="meta">
+        相关链接：
+        <a href="https://github.com/0515wlx/draftslice">GitHub</a> ·
+        <a href="https://github.com/0515wlx/draftslice/blob/main/docs/lean-slice.md">lean-slice design</a> ·
+        <a href="https://github.com/vllm-project/vllm/pull/47885">vLLM #47885</a>
+      </p>
+    </article>
+
+    <footer class="site">
+      <p>© 2026 wlx · 文章采用 CC BY 4.0，代码采用 Apache-2.0</p>
+    </footer>
+  </main>
+</body>
+</html>
